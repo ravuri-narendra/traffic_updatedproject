@@ -1,215 +1,258 @@
 import os
 import sys
 import time
-import math
+import cv2
+import numpy as np
+import mss
+import win32gui
+from ultralytics import YOLO
 
-# ---------------- SUMO SETUP ---------------- #
-
+# -------------------- SUMO SETUP --------------------
 if 'SUMO_HOME' in os.environ:
     sys.path.append(os.path.join(os.environ['SUMO_HOME'], 'tools'))
 else:
-    raise Exception("Set SUMO_HOME")
+    raise Exception("Please set SUMO_HOME environment variable")
 
 import traci
 
 TL_ID = "center"
-
 MIN_GREEN = 5
 MAX_GREEN = 60
 YELLOW = 3
-STARVATION_LIMIT = 50
+EMERGENCY_HOLD = 10
+DENSITY_FACTOR = 2.0
 
-# Improved PCU weights
-PCU_WEIGHTS = {
-    "bus": 3.5,
-    "truck": 3.0,
-    "car": 1.0,
-    "bike": 0.5,
-    "ambulance": 2.0
-}
-
-# ---------------- EMERGENCY AGENT ---------------- #
-
-class EmergencyAgent:
-    def check(self):
-        for v in traci.vehicle.getIDList():
-            if traci.vehicle.getVehicleClass(v) == "emergency":
-                return traci.vehicle.getLaneID(v)
-        return None
-
-
-# ---------------- TRAFFIC AGENT ---------------- #
-
-class TrafficAgent:
+# -------------------- VISION AGENT --------------------
+class VisionAgent:
     def __init__(self):
-        self.last_served = "EW"
-        self.wait_time = {"NS": 0, "EW": 0}
+        print("[INFO] Loading YOLO model...", flush=True)
+        self.model = YOLO('yolov8n.pt')
+        print("[INFO] YOLO model loaded.", flush=True)
+        self.confidence = 0.25
 
-    def get_lanes(self):
-        lanes = traci.lane.getIDList()
-        NS, EW = [], []
+        self.emergency_lower = np.array([90, 80, 50]) # Broader Blue range
+        self.emergency_upper = np.array([140, 255, 255])
+        self.emergency_threshold = 20
 
-        for lane in lanes:
-            if any(x in lane for x in ["N2C", "C2N", "S2C", "C2S"]):
-                NS.append(lane)
-            else:
-                EW.append(lane)
+        self.sct = mss.mss()
+        self.window_rect = None
 
-        return NS, EW
+        self.rois = {"N": None, "S": None, "E": None, "W": None}
 
-    def density(self, lanes):
-        total = 0
-        for lane in lanes:
-            for v in traci.lane.getLastStepVehicleIDs(lane):
-                vtype = traci.vehicle.getTypeID(v)
-                total += PCU_WEIGHTS.get(vtype, 1.0)
-        return total
+    def initialize_window(self):
+        time.sleep(2)  # Give time for the GUI to open
+        hwnds = []
+        def enum_cb(hwnd, arg):
+            if win32gui.IsWindowVisible(hwnd):
+                name = win32gui.GetWindowText(hwnd)
+                if name:
+                    if "SUMO 1." in name and "Visual Studio Code" not in name:
+                        hwnds.append(hwnd)
+                        print(f"[DEBUG] Found potential SUMO window: {name}", flush=True)
 
-    # 🔥 Improved Green Time Formula
-    def green_time(self, density):
-        if density == 0:
-            return 0
+        win32gui.EnumWindows(enum_cb, None)
+        if not hwnds:
+            # Fallback for headless or if window not found
+            print("[WARNING] SUMO-GUI window not found. Capture might fail.", flush=True)
+            self.window_rect = {"left": 0, "top": 0, "width": 800, "height": 600}
+            return
+        
+        hwnd = hwnds[0]
+        rect = win32gui.GetWindowRect(hwnd)
+        self.window_rect = {
+            "left": rect[0],
+            "top": rect[1] + 50,
+            "width": rect[2] - rect[0],
+            "height": rect[3] - rect[1] - 50
+        }
 
-        alpha = 2.0
-        beta = 1.5
+    def capture_screen(self):
+        try:
+            img = np.array(self.sct.grab(self.window_rect))
+            return cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+        except Exception as e:
+            print(f"[ERROR] Capture failed: {e}", flush=True)
+            return np.zeros((600, 800, 3), dtype=np.uint8)
 
-        g = MIN_GREEN + alpha * density + beta * math.sqrt(density)
+    def setup_rois(self, frame):
+        h, w = frame.shape[:2]
+        self.rois["N"] = np.array([[int(0.45*w), int(0.1*h)], [int(0.55*w), int(0.1*h)], [int(0.55*w), int(0.4*h)], [int(0.45*w), int(0.4*h)]], dtype=np.int32)
+        self.rois["S"] = np.array([[int(0.45*w), int(0.6*h)], [int(0.55*w), int(0.6*h)], [int(0.55*w), int(0.9*h)], [int(0.45*w), int(0.9*h)]], dtype=np.int32)
+        self.rois["E"] = np.array([[int(0.6*w), int(0.45*h)], [int(0.9*w), int(0.45*h)], [int(0.9*w), int(0.55*h)], [int(0.6*w), int(0.55*h)]], dtype=np.int32)
+        self.rois["W"] = np.array([[int(0.1*w), int(0.45*h)], [int(0.4*w), int(0.45*h)], [int(0.4*w), int(0.55*h)], [int(0.1*w), int(0.55*h)]], dtype=np.int32)
 
-        return min(MAX_GREEN, g)
+    def detect_vehicles(self, frame):
+        results = self.model(frame, conf=self.confidence, verbose=False)[0]
+        detections = []
+        annotated = frame.copy()
 
-    def decide(self, d_ns, d_ew):
-        if d_ns == 0 and d_ew == 0:
-            return None
+        for box in results.boxes:
+            x1, y1, x2, y2 = map(int, box.xyxy[0])
+            cls = int(box.cls[0])
+            label = self.model.names[cls]
+            if label not in ['car', 'truck', 'bus', 'motorcycle', 'bicycle']: continue
+            centroid = ((x1+x2)//2, (y1+y2)//2)
+            detections.append({'bbox': (x1, y1, x2, y2), 'centroid': centroid, 'class': label})
+            cv2.rectangle(annotated, (x1,y1),(x2,y2),(0,255,0),2)
+        return detections, annotated
 
-        if d_ns == 0:
-            return "EW"
-        if d_ew == 0:
-            return "NS"
+    def map_to_lanes(self, detections, frame):
+        densities = {"N": 0, "S": 0, "E": 0, "W": 0}
+        emergency = []
+        for det in detections:
+            cx, cy = det['centroid']
+            for lane, pts in self.rois.items():
+                if cv2.pointPolygonTest(pts, (cx,cy), False) >= 0:
+                    densities[lane] += 2.5 if det['class'] in ['truck','bus'] else 1
+                    break
 
-        # starvation prevention
-        if self.wait_time["NS"] > STARVATION_LIMIT:
-            return "NS"
-        if self.wait_time["EW"] > STARVATION_LIMIT:
-            return "EW"
+        for lane, pts in self.rois.items():
+            mask = np.zeros(frame.shape[:2], dtype=np.uint8); cv2.fillPoly(mask, [pts], 255)
+            roi_pixels = cv2.bitwise_and(frame, frame, mask=mask)
+            hsv = cv2.cvtColor(roi_pixels, cv2.COLOR_BGR2HSV)
+            l_green = np.array([35, 40, 40]); u_green = np.array([85, 255, 255])
+            l_road = np.array([0, 0, 0]); u_road = np.array([180, 60, 200])
+            non_road = cv2.bitwise_not(cv2.bitwise_or(cv2.inRange(hsv, l_green, u_green), cv2.inRange(hsv, l_road, u_road)))
+            h_density = cv2.countNonZero(cv2.bitwise_and(non_road, mask)) / 100.0
+            densities[lane] = max(densities[lane], h_density)
 
-        # round robin
-        return "NS" if self.last_served == "EW" else "EW"
+            e_mask = cv2.inRange(hsv, self.emergency_lower, self.emergency_upper)
+            if cv2.countNonZero(e_mask) >= self.emergency_threshold: emergency.append(lane)
+        return densities, emergency
 
-    def update(self, chosen, time_used):
-        for g in ["NS", "EW"]:
-            if g == chosen:
-                self.wait_time[g] = 0
-            else:
-                self.wait_time[g] += time_used
+    def draw_rois(self, frame):
+        colors = {"N": (255,0,0), "S": (0,255,0), "E": (0,0,255), "W": (255,255,0)}
+        for lane, pts in self.rois.items(): cv2.polylines(frame, [pts], True, colors[lane], 2)
+        return frame
 
-        self.last_served = chosen
-
-
-# ---------------- METRICS ---------------- #
-
-class Metrics:
+# -------------------- DECISION AGENT --------------------
+class DecisionAgent:
     def __init__(self):
-        self.total_wait = 0
-        self.vehicle_steps = 0
-        self.max_queue = 0
-        self.throughput = 0
+        self.phase_timer = 0
+        self.current_phase = None
+        self.lanes = ["N", "E", "S", "W"]
+        self.current_index = 0
+        self.wait_time = {lane: 0 for lane in self.lanes}
+        self.max_wait = 50
 
-    def update(self):
-        vehicles = traci.vehicle.getIDList()
+    def compute_time(self, density):
+        return min(MAX_GREEN, MIN_GREEN + density * DENSITY_FACTOR)
 
-        for v in vehicles:
-            self.total_wait += traci.vehicle.getWaitingTime(v)
+    def decide(self, densities, emergency):
+        for lane in self.lanes: self.wait_time[lane] += 1
+        if emergency:
+            chosen = max(set(emergency), key=emergency.count)
+            if chosen == self.current_phase and self.phase_timer > 0:
+                return None, 0, "Emergency Already Served"
+            self.wait_time[chosen] = 0
+            return chosen, EMERGENCY_HOLD, "Emergency"
 
-        self.vehicle_steps += len(vehicles)
+        for lane in self.lanes:
+            if self.wait_time[lane] > self.max_wait and densities[lane] > 0:
+                self.wait_time[lane] = 0
+                return lane, self.compute_time(densities[lane]), "Starvation Fix"
 
-        # queue length
-        for lane in traci.lane.getIDList():
-            q = traci.lane.getLastStepHaltingNumber(lane)
-            self.max_queue = max(self.max_queue, q)
+        for _ in range(4):
+            self.current_index = (self.current_index + 1) % 4
+            candidate = self.lanes[self.current_index]
+            if densities[candidate] > 0:
+                self.wait_time[candidate] = 0
+                return candidate, self.compute_time(densities[candidate]), "Round-Robin"
+        return None, 0, "No Traffic"
 
-        # throughput
-        self.throughput += traci.simulation.getArrivedNumber()
-
-    def report(self):
-        avg_wait = self.total_wait / max(1, self.vehicle_steps)
-
-        print("\n📊 PERFORMANCE REPORT")
-        print(f"Average Waiting Time: {avg_wait:.2f} sec")
-        print(f"Max Queue Length: {self.max_queue}")
-        print(f"Throughput (vehicles cleared): {self.throughput}")
-
-
-# ---------------- MAIN ---------------- #
-
+# -------------------- MAIN --------------------
 def run():
+    print("[INFO] Starting SUMO-GUI...", flush=True)
+    try:
+        traci.start([
+            "C:/Program Files (x86)/Eclipse/Sumo/bin/sumo-gui.exe",
+            "-c", "C:/Users/ravur_48/OneDrive/Desktop/traffic_project/traffic.sumocfg",
+            "--start"
+        ])
+    except Exception as e:
+        print(f"[ERROR] Could not start SUMO: {e}", flush=True)
+        return
 
-    traci.start([
-        "C:/Program Files (x86)/Eclipse/Sumo/bin/sumo-gui.exe",
-        "-c", "C:/Users/ravur_48/OneDrive/Desktop/traffic_project/traffic.sumocfg",
-        "--start"
-    ])
+    vision = VisionAgent()
+    decision = DecisionAgent()
+    traci.trafficlight.setPhase(TL_ID, 0)
+    vision.initialize_window()
+    
+    frame = vision.capture_screen()
+    vision.setup_rois(frame)
+    
+    last_detections = []
+    step = 0
 
-    emergency = EmergencyAgent()
-    agent = TrafficAgent()
-    metrics = Metrics()
+    try:
+        while traci.simulation.getMinExpectedNumber() > 0:
+            frame = vision.capture_screen()
+            if step % 5 == 0:
+                detections, annotated = vision.detect_vehicles(frame)
+                last_detections = detections
+            else:
+                detections = last_detections
+                annotated = frame.copy()
 
-    while traci.simulation.getMinExpectedNumber() > 0:
+            densities, emergency = vision.map_to_lanes(detections, frame)
+            
+            should_decide = (decision.phase_timer <= 0) or (len(emergency) > 0)
+            reason = "Running Cycle"
+            
+            if should_decide:
+                phase, green, d_reason = decision.decide(densities, emergency)
+                if phase:
+                    phase_map = {"N": 0, "E": 2, "S": 4, "W": 6}
+                    traci.trafficlight.setPhase(TL_ID, phase_map[phase])
+                    decision.phase_timer = int(green)
+                    decision.current_phase = phase
+                    reason = d_reason
 
-        # 🚑 Emergency priority
-        lane = emergency.check()
-        if lane:
-            print("🚑 Emergency detected!")
+            # Update Dashboard State
+            current_phase_idx = traci.trafficlight.getPhase(TL_ID)
+            # 0=N, 1=N_Y, 2=E, 3=E_Y, 4=S, 5=S_Y, 6=W, 7=W_Y
+            ui_phases = {l: "red" for l in ["N", "S", "E", "W"]}
+            if current_phase_idx == 0: ui_phases["N"] = "green"
+            elif current_phase_idx == 1: ui_phases["N"] = "yellow"
+            elif current_phase_idx == 2: ui_phases["E"] = "green"
+            elif current_phase_idx == 3: ui_phases["E"] = "yellow"
+            elif current_phase_idx == 4: ui_phases["S"] = "green"
+            elif current_phase_idx == 5: ui_phases["S"] = "yellow"
+            elif current_phase_idx == 6: ui_phases["W"] = "green"
+            elif current_phase_idx == 7: ui_phases["W"] = "yellow"
 
-            phase = 0 if any(x in lane for x in ["N", "S"]) else 2
-            traci.trafficlight.setPhase(TL_ID, phase)
+            # Log current state to console
+            print(f"Step {step} | Phases: {ui_phases} | Densities: {densities} | Reason: {reason}", flush=True)
 
-            for _ in range(10):
-                traci.simulationStep()
-                metrics.update()
-                time.sleep(0.05)
-            continue
+            annotated = vision.draw_rois(annotated)
+            cv2.imshow("Vision Analytics", annotated)
+            if cv2.waitKey(1) == ord('q'): break
 
-        NS, EW = agent.get_lanes()
-        d_ns = agent.density(NS)
-        d_ew = agent.density(EW)
-
-        chosen = agent.decide(d_ns, d_ew)
-
-        if chosen is None:
             traci.simulationStep()
-            metrics.update()
-            continue
+            time.sleep(0.01)
 
-        if chosen == "NS":
-            phase = 0
-            density = d_ns
-        else:
-            phase = 2
-            density = d_ew
-
-        g_time = agent.green_time(density)
-
-        print(f"{chosen} | Density={density:.2f} | Time={g_time:.2f}")
-
-        traci.trafficlight.setPhase(TL_ID, phase)
-
-        for _ in range(int(g_time) + YELLOW):
-            traci.simulationStep()
-            metrics.update()
-
-            # interrupt if emergency comes
-            if emergency.check():
-                break
-
-            time.sleep(0.05)
-
-        agent.update(chosen, g_time)
-
-    metrics.report()
-    traci.close()
-
-
-# ---------------- RUN ---------------- #
+            if decision.phase_timer > 0:
+                decision.phase_timer -= 0.5
+            else:
+                if decision.current_phase is not None:
+                    phase_map = {"N": 0, "E": 2, "S": 4, "W": 6}
+                    yellow_phase = phase_map[decision.current_phase] + 1
+                    traci.trafficlight.setPhase(TL_ID, yellow_phase)
+                    for _ in range(YELLOW):
+                        traci.simulationStep()
+                        time.sleep(0.05)
+                    decision.current_phase = None
+            step += 1
+            
+    except traci.exceptions.FatalTraCIError:
+        print("\n[INFO] SUMO closed by user.", flush=True)
+    except Exception as e:
+        print(f"\n[ERROR] Simulation Loop Error: {e}", flush=True)
+    finally:
+        cv2.destroyAllWindows()
+        try: traci.close()
+        except: pass
+        print("\n[INFO] Simulation ended.")
 
 if __name__ == "__main__":
     run()

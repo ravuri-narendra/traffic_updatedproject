@@ -10,4 +10,8 @@
         <end value="400"/>
     </time>
 
+    <gui_only>
+        <gui-settings-file value="gui-settings.xml"/>
+    </gui_only>
+
 </configuration>

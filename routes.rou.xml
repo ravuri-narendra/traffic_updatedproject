@@ -1,41 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
 <routes>
 
-    <!-- 🚗 Vehicle Types -->
+    <!-- Vehicle Types -->
     <vType id="car" accel="2.5" decel="4.5" length="5" maxSpeed="20" color="1,1,0"/>
     <vType id="bike" accel="3.0" decel="4.5" length="2" maxSpeed="25" color="1,0,0"/>
     <vType id="bus" accel="1.5" decel="4.0" length="10" maxSpeed="15" color="0,1,0"/>
 
-    <!-- 🚑 Emergency Vehicle -->
     <vType id="ambulance" vClass="emergency"
            accel="3.5" decel="5.0"
            length="5" maxSpeed="30"
            color="0,0,1"/>
 
-    <!-- 🛣️ Routes -->
+    <!-- Routes -->
     <route id="r_ns" edges="N2C C2S"/>
     <route id="r_sn" edges="S2C C2N"/>
     <route id="r_ew" edges="E2C C2W"/>
     <route id="r_we" edges="W2C C2E"/>
 
-    <!-- 🚗 Balanced Traffic (Improved realism) -->
-
     <!-- Cars -->
-    <flow id="car_ns" type="car" route="r_ns" begin="0" end="400" vehsPerHour="900"/>
-    <flow id="car_sn" type="car" route="r_sn" begin="0" end="400" vehsPerHour="900"/>
-    <flow id="car_ew" type="car" route="r_ew" begin="0" end="400" vehsPerHour="900"/>
-    <flow id="car_we" type="car" route="r_we" begin="0" end="400" vehsPerHour="900"/>
+    <flow id="car_ns" type="car" route="r_ns" begin="0" end="400" vehsPerHour="300" departLane="best" departSpeed="max"/>
+    <flow id="car_sn" type="car" route="r_sn" begin="0" end="400" vehsPerHour="300" departLane="best" departSpeed="max"/>
+    <flow id="car_ew" type="car" route="r_ew" begin="0" end="400" vehsPerHour="300" departLane="best" departSpeed="max"/>
+    <flow id="car_we" type="car" route="r_we" begin="0" end="400" vehsPerHour="300" departLane="best" departSpeed="max"/>
 
     <!-- Bikes -->
-    <flow id="bike_ns" type="bike" route="r_ns" begin="0" end="400" vehsPerHour="1200"/>
-    <flow id="bike_ew" type="bike" route="r_ew" begin="0" end="400" vehsPerHour="1200"/>
+    <flow id="bike_ns" type="bike" route="r_ns" begin="0" end="400" vehsPerHour="400" departLane="best"/>
+    <flow id="bike_sn" type="bike" route="r_sn" begin="0" end="400" vehsPerHour="400" departLane="best"/>
+    <flow id="bike_ew" type="bike" route="r_ew" begin="0" end="400" vehsPerHour="400" departLane="best"/>
+    <flow id="bike_we" type="bike" route="r_we" begin="0" end="400" vehsPerHour="400" departLane="best"/>
 
     <!-- Buses -->
-    <flow id="bus_ns" type="bus" route="r_ns" begin="0" end="400" vehsPerHour="200"/>
-    <flow id="bus_ew" type="bus" route="r_ew" begin="0" end="400" vehsPerHour="200"/>
+    <flow id="bus_ns" type="bus" route="r_ns" begin="0" end="400" vehsPerHour="80" departLane="best"/>
+    <flow id="bus_sn" type="bus" route="r_sn" begin="0" end="400" vehsPerHour="80" departLane="best"/>
+    <flow id="bus_ew" type="bus" route="r_ew" begin="0" end="400" vehsPerHour="80" departLane="best"/>
+    <flow id="bus_we" type="bus" route="r_we" begin="0" end="400" vehsPerHour="80" departLane="best"/>
 
-    <!-- 🚑 Ambulances (randomized departures) -->
-    <!-- 🚑 Random ambulances -->
-<flow id="amb_ns" type="ambulance" route="r_ns" begin="0" end="400" probability="0.01"/>
-<flow id="amb_ew" type="ambulance" route="r_ew" begin="0" end="400" probability="0.01"/>
+    <!-- Ambulance (Increased probability for testing) -->
+    <flow id="amb_n" type="ambulance" route="r_ns" begin="0" end="400" probability="0.02"/>
+    <flow id="amb_s" type="ambulance" route="r_sn" begin="0" end="400" probability="0.02"/>
+    <flow id="amb_e" type="ambulance" route="r_ew" begin="0" end="400" probability="0.02"/>
+    <flow id="amb_w" type="ambulance" route="r_we" begin="0" end="400" probability="0.02"/>
 
 </routes>
