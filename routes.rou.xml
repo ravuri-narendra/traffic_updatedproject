@@ -36,10 +36,10 @@
     <flow id="bus_ew" type="bus" route="r_ew" begin="0" end="400" vehsPerHour="80" departLane="best"/>
     <flow id="bus_we" type="bus" route="r_we" begin="0" end="400" vehsPerHour="80" departLane="best"/>
 
-    <!-- Ambulance (Increased probability for testing) -->
-    <flow id="amb_n" type="ambulance" route="r_ns" begin="0" end="400" probability="0.02"/>
-    <flow id="amb_s" type="ambulance" route="r_sn" begin="0" end="400" probability="0.02"/>
-    <flow id="amb_e" type="ambulance" route="r_ew" begin="0" end="400" probability="0.02"/>
-    <flow id="amb_w" type="ambulance" route="r_we" begin="0" end="400" probability="0.02"/>
+    <!-- Ambulance (Reduced probability as requested) -->
+    <flow id="amb_n" type="ambulance" route="r_ns" begin="0" end="400" probability="0.005"/>
+    <flow id="amb_s" type="ambulance" route="r_sn" begin="0" end="400" probability="0.005"/>
+    <flow id="amb_e" type="ambulance" route="r_ew" begin="0" end="400" probability="0.005"/>
+    <flow id="amb_w" type="ambulance" route="r_we" begin="0" end="400" probability="0.005"/>
 
 </routes>
