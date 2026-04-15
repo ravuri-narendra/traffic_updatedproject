@@ -14,13 +14,47 @@ else:
     raise Exception("Please set SUMO_HOME environment variable")
 
 import traci
+try:
+    import serial
+except ImportError:
+    print("[WARNING] 'pyserial' not installed. Run: pip install pyserial")
+    serial = None
+
+# Arduino Config
+ARDUINO_PORT = "COM7"  # Change to your Arduino's COM port
+BAUD_RATE = 115200
+arduino = None
+
+try:
+    if serial:
+        arduino = serial.Serial(ARDUINO_PORT, BAUD_RATE, timeout=0.1)
+        print(f"[INFO] Arduino connected on {ARDUINO_PORT}")
+except Exception as e:
+    print(f"[WARNING] Arduino not detected on {ARDUINO_PORT}: {e}")
 
 TL_ID = "center"
 MIN_GREEN = 5
 MAX_GREEN = 60
 YELLOW = 3
-EMERGENCY_HOLD = 10
+ALL_RED = 2
+EMERGENCY_HOLD = 20
 DENSITY_FACTOR = 2.0
+DENSITY_THRESHOLD = 0.5
+
+# 1. LANE & PHASE MAPPING
+LANE_MAP = {
+    "N": "N2C",
+    "S": "S2C",
+    "E": "E2C",
+    "W": "W2C"
+}
+
+PHASE_MAP = {
+    "N": 0,
+    "E": 3,
+    "S": 6,
+    "W": 9
+}
 
 
 # -------------------- VISION AGENT --------------------
@@ -53,7 +87,6 @@ class VisionAgent:
 
         win32gui.EnumWindows(enum_cb, None)
         if not hwnds:
-            # Fallback for headless or if window not found
             print("[WARNING] SUMO-GUI window not found. Capture might fail.", flush=True)
             self.window_rect = {"left": 0, "top": 0, "width": 800, "height": 600}
             return
@@ -77,10 +110,11 @@ class VisionAgent:
 
     def setup_rois(self, frame):
         h, w = frame.shape[:2]
-        self.rois["N"] = np.array([[int(0.45*w), int(0.1*h)], [int(0.55*w), int(0.1*h)], [int(0.55*w), int(0.4*h)], [int(0.45*w), int(0.4*h)]], dtype=np.int32)
-        self.rois["S"] = np.array([[int(0.45*w), int(0.6*h)], [int(0.55*w), int(0.6*h)], [int(0.55*w), int(0.9*h)], [int(0.45*w), int(0.9*h)]], dtype=np.int32)
-        self.rois["E"] = np.array([[int(0.6*w), int(0.45*h)], [int(0.9*w), int(0.45*h)], [int(0.9*w), int(0.55*h)], [int(0.6*w), int(0.55*h)]], dtype=np.int32)
-        self.rois["W"] = np.array([[int(0.1*w), int(0.45*h)], [int(0.4*w), int(0.45*h)], [int(0.4*w), int(0.55*h)], [int(0.1*w), int(0.55*h)]], dtype=np.int32)
+        # Extended ROIs closer to the center (intersection line) to avoid a blind spot
+        self.rois["N"] = np.array([[int(0.45*w), int(0.1*h)], [int(0.55*w), int(0.1*h)], [int(0.55*w), int(0.48*h)], [int(0.45*w), int(0.48*h)]], dtype=np.int32)
+        self.rois["S"] = np.array([[int(0.45*w), int(0.52*h)], [int(0.55*w), int(0.52*h)], [int(0.55*w), int(0.9*h)], [int(0.45*w), int(0.9*h)]], dtype=np.int32)
+        self.rois["E"] = np.array([[int(0.52*w), int(0.45*h)], [int(0.9*w), int(0.45*h)], [int(0.9*w), int(0.55*h)], [int(0.52*w), int(0.55*h)]], dtype=np.int32)
+        self.rois["W"] = np.array([[int(0.1*w), int(0.45*h)], [int(0.48*w), int(0.45*h)], [int(0.48*w), int(0.55*h)], [int(0.1*w), int(0.55*h)]], dtype=np.int32)
 
     def detect_vehicles(self, frame):
         results = self.model(frame, conf=self.confidence, verbose=False)[0]
@@ -132,58 +166,113 @@ class DecisionAgent:
     def __init__(self):
         self.phase_timer = 0
         self.current_phase = None
-        self.lanes = ["N", "W", "S", "E"]  # Sequence: N -> W -> S -> E
+        self.lanes = ["N", "E", "S", "W"]  
         self.current_index = 0
+        self.total_emergencies = 0
+        self.decision_reason = "System Booting"
+        self.ev_queue = []
+        self.resume_index = None
 
     def compute_time(self, density):
-        # Formula: Green time is proportional to density but never exceeds MAX_GREEN
+        if density <= DENSITY_THRESHOLD:
+            return 0
         return min(MAX_GREEN, MIN_GREEN + (density * DENSITY_FACTOR))
 
-    def decide(self, densities, emergency):
-        # Priority 1: Emergency Vehicles
-        if emergency:
-            chosen = max(set(emergency), key=emergency.count)
-            # Don't switch if we are already serving this lane with a high priority
-            if chosen == self.current_phase and self.phase_timer > 0:
-                return None, 0, "Emergency Already Served"
-            
-            # Switch to Emergency Lane immediately
-            print(f"[AGENT] EMERGENCY DETECTED in {chosen} lane! Preempting cycle.", flush=True)
-            # Update sequence pointer so we know which lane was intended next
-            # (We don't update self.current_index here to preserve the RR sequence)
-            return chosen, EMERGENCY_HOLD, "Emergency Priority"
+    def decide(self, densities, current_lane):
+        # 1. Emergency Priority Logic
+        if self.ev_queue:
+            chosen_lane = self.ev_queue.pop(0)
+            if self.resume_index is None:
+                self.resume_index = self.current_index
+            return chosen_lane, EMERGENCY_HOLD, "🚨 Emergency Queue Priority"
 
-        # Stabilized Circular Round-Robin
-        # Starts searching from the lane AFTER the last one we served
-        print(f"\n[AGENT] Searching for next lane in sequence (Last: {self.lanes[self.current_index]})...", flush=True)
+        # 2. Resume sequence after EV
+        if self.resume_index is not None:
+            self.current_index = self.resume_index
+            self.resume_index = None
+
+        # 3. Intelligent Round-Robin / Stay Green logic
+        # First, check if current lane still has significant traffic
+        if current_lane and densities.get(current_lane, 0) > DENSITY_THRESHOLD:
+            # Check if anyone else is waiting more urgently? 
+            # Simplified: Keep green if density is high, unless others are waiting too long.
+            # But standard Round-Robin usually cycles. Let's allow staying green if no one else is waiting.
+            others_waiting = any(v > DENSITY_THRESHOLD for k, v in densities.items() if k != current_lane)
+            if not others_waiting:
+                return current_lane, self.compute_time(densities[current_lane]), "Stay Green (No competition)"
+
+        # 4. Standard Round-Robin
+        start_search = (self.current_index + 1) % 4
+        for i in range(4):
+            idx = (start_search + i) % 4
+            lane = self.lanes[idx]
+            if densities[lane] > DENSITY_THRESHOLD:
+                self.current_index = idx
+                return lane, self.compute_time(densities[lane]), "Normal Round-Robin"
         
-        search_idx = self.current_index
-        for _ in range(4):
-            search_idx = (search_idx + 1) % 4
-            candidate = self.lanes[search_idx]
-            
-            if densities[candidate] > 0:
-                print(f"[AGENT] Found traffic in {candidate} (Density: {densities[candidate]:.2f}). Switching!", flush=True)
-                self.current_index = search_idx  # Update official pointer
-                return candidate, self.compute_time(densities[candidate]), "Circular Round-Robin"
+        return None, 0, "No traffic detected"
+
+# -------------------- UTILS --------------------
+def validate_sumo_setup():
+    print("\n=== LANE MAPPING VALIDATION ===")
+    all_edges = traci.edge.getIDList()
+    all_lanes = traci.lane.getIDList()
+    
+    for direction, entity_id in LANE_MAP.items():
+        exists = (entity_id in all_edges) or (entity_id in all_lanes)
+        status = "OK" if exists else "NOT FOUND ⚠️"
+        print(f"{direction} \u2192 {entity_id}: {status}")
+        if not exists:
+            # Auto-detect fallback
+            print(f"  [INFO] Searching for best match for {direction}...")
+            # Simple heuristic: look for edges ending or starting with direction letter
+            matches = [e for e in all_edges if direction in e.upper()]
+            if matches: print(f"  [TIP] Did you mean one of these? {matches}")
+
+    print("\n=== PHASE VALIDATION ===")
+    try:
+        logic = traci.trafficlight.getAllProgramLogics(TL_ID)[0]
+        phases = logic.phases
+        print(f"Traffic Light '{TL_ID}' has {len(phases)} phases.")
+        for direction, phase_idx in PHASE_MAP.items():
+            if phase_idx < len(phases):
+                state = phases[phase_idx].state
+                print(f"  Phase {phase_idx} ({direction}): {state}")
             else:
-                print(f"[AGENT] Lane {candidate} is empty. Skipping...", flush=True)
-        
-        return None, 0, "All Lanes Empty"
-
+                print(f"  [ERROR] Phase index {phase_idx} for {direction} out of bounds!")
+    except Exception as e:
+        print(f"  [ERROR] Could not validate TL phases: {e}")
+    print("==============================\n")
+# -------------------- SERIAL SEND FUNCTION --------------------
+def send_to_arduino(direction, color):
+    global arduino
+    if arduino:
+        try:
+            color_map = {
+                "GREEN": "G",
+                "YELLOW": "Y",
+                "RED": "R"
+            }
+            msg = f"{direction}{color_map.get(color, 'R')}\n"
+            arduino.write(msg.encode())
+            arduino.flush()
+            print(f"[ARDUINO] Sent: {msg.strip()}")
+        except Exception as e:
+            print(f"[ERROR] Arduino send failed: {e}")
 # -------------------- MAIN --------------------
 def run():
     print("[INFO] Starting SUMO-GUI...", flush=True)
     try:
         sumo_binary = os.path.join(os.environ['SUMO_HOME'], 'bin', 'sumo-gui.exe')
         traci.start([
-            sumo_binary,
-            "-c", "traffic.sumocfg",
-            "--start"
+            sumo_binary, "-c", "traffic.sumocfg", "--start"
         ])
     except Exception as e:
         print(f"[ERROR] Could not start SUMO: {e}", flush=True)
         return
+
+    # Perform Validation
+    validate_sumo_setup()
 
     vision = VisionAgent()
     decision = DecisionAgent()
@@ -191,89 +280,135 @@ def run():
     traci.trafficlight.setPhase(TL_ID, 0)
     vision.initialize_window()
     
-    # Initialize the Vision Window at a fixed position away from the capture area
-    # (Fixes the "Hall of Mirrors" effect)
-    cv2.namedWindow("Vision Analysis - Snapshot Viewer", cv2.WINDOW_NORMAL)
-    cv2.moveWindow("Vision Analysis - Snapshot Viewer", 10, 600) 
+    cv2.namedWindow("Vision Analysis", cv2.WINDOW_NORMAL)
+    cv2.moveWindow("Vision Analysis", 10, 600) 
     
     frame = vision.capture_screen()
     vision.setup_rois(frame)
     
-    last_detections = []
     step = 0
+    densities = {d: 0.0 for d in LANE_MAP.keys()}
+    v_densities = {d: 0.0 for d in LANE_MAP.keys()} # Vision only
+    s_densities = {d: 0.0 for d in LANE_MAP.keys()} # SUMO only
+    current_emergency = []
 
     try:
         while traci.simulation.getMinExpectedNumber() > 0:
-            # Check for triggers (Timer expiry or Emergency)
-            # (We scan a frame every few steps to detect emergencies)
-            emergency = []
+            # 1. Vision + SUMO Hybrid Processing (Every 5 steps)
             if step % 5 == 0:
                 frame = vision.capture_screen()
                 detections, annotated = vision.detect_vehicles(frame)
-                densities, emergency = vision.map_to_lanes(detections, frame)
+                v_densities, current_emergency = vision.map_to_lanes(detections, frame)
+
+                # Fetch SUMO direct vehicle counts and combine for Hybrid Density
+                for direction, entity_id in LANE_MAP.items():
+                    try:
+                        # Normalize vehicle count to a comparable density scale
+                        # traci returns vehicle count; vision returns weighted pixels/detections
+                        sumo_count = traci.edge.getLastStepVehicleNumber(entity_id) if entity_id in traci.edge.getIDList() else traci.lane.getLastStepVehicleNumber(entity_id)
+                        s_densities[direction] = float(sumo_count)
+                        
+                        # Hybrid Mode: Take max of vision and simulation to ensure we don't miss anything
+                        densities[direction] = max(v_densities[direction], s_densities[direction])
+                    except:
+                        densities[direction] = v_densities[direction]
                 
-                # Should we decide now?
-                should_decide = (decision.phase_timer <= 0) or (len(emergency) > 0)
+                # Update EV Queue
+                for lane in current_emergency:
+                    if lane not in decision.ev_queue: decision.ev_queue.append(lane)
                 
-                if should_decide:
-                    # Decide next phase
-                    phase, green, d_reason = decision.decide(densities, emergency)
+                annotated = vision.draw_rois(annotated)
+                cv2.imshow("Vision Analysis", annotated)
+
+            # --- 1.5. EMERGENCY SIGNAL PREEMPTION ---
+            # Real-world traffic systems don't make ambulances wait for a timer to finish.
+            # If an EV is queued but another lane currently has the green light, we MUST interrupt it immediately.
+            if decision.phase_timer > 0 and decision.ev_queue:
+                queued_ev = decision.ev_queue[0]
+                if decision.current_phase is not None and decision.current_phase != queued_ev:
+                    # Force the current green light to end immediately to serve the ambulance
+                    decision.phase_timer = 0
+
+            # 2. State Machine for Traffic Signal
+            if decision.phase_timer <= 0:
+                next_lane, green_time, reason = decision.decide(densities, decision.current_phase)
+                
+                if next_lane and green_time > 0:
+                    # --- TRANSITION START ---
+                    if decision.current_phase is not None and next_lane != decision.current_phase:
+                        # 1. Switch to Yellow (Phase index + 1)
+                        traci.trafficlight.setPhase(TL_ID, PHASE_MAP[decision.current_phase] + 1)
+                        send_to_arduino(decision.current_phase, "YELLOW")
+                        for _ in range(YELLOW):
+                            traci.simulationStep()
+                            time.sleep(1.0)
+                            step += 1
+                        
+                        # 2. Switch to All-Red (Phase index + 2)
+                        traci.trafficlight.setPhase(TL_ID, PHASE_MAP[decision.current_phase] + 2)
+                        send_to_arduino(decision.current_phase, "RED") 
+                        for _ in range(ALL_RED):
+                            traci.simulationStep()
+                            time.sleep(1.0)
+                            step += 1
+                        
+                    # 3. Switch to Green (Target Lane)
+                    traci.trafficlight.setPhase(TL_ID, PHASE_MAP[next_lane])
+                    send_to_arduino(next_lane, "GREEN")
                     
-                    if phase:
-                        # 1. Visual Buffer
-                        time.sleep(0.5)
-                        
-                        # 2. Actuate SUMO
-                        phase_map = {"N": 0, "E": 2, "S": 4, "W": 6}
-                        traci.trafficlight.setPhase(TL_ID, phase_map[phase])
-                        decision.phase_timer = int(green)
-                        decision.current_phase = phase
-                        
-                        # 3. Label the Snapshot for the user
-                        # Add a semi-transparent box for readability
-                        cv2.rectangle(annotated, (30, 10), (550, 250), (0, 0, 0), -1)
-                        
-                        label_text = f"DECISION: {phase} GREEN ({green}s)"
-                        cv2.putText(annotated, label_text, (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
-                        
-                        # Add sub-labels for all lane densities
-                        y_offset = 100
-                        for lane, val in densities.items():
-                            d_text = f"{lane} Density: {val:.2f}"
-                            color = (0, 255, 255) if lane == phase else (180, 180, 180)
-                            cv2.putText(annotated, d_text, (50, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
-                            y_offset += 35
-                        
-                        # 4. Show the Snapshot Statically
-                        annotated = vision.draw_rois(annotated)
-                        cv2.imshow("Vision Analysis - Snapshot Viewer", annotated)
-                        
-                        # 5. Clear Console and Log Decision
-                        print(f"\n[AGENT] {d_reason} -> SWITCHING TO {phase} ({green}s)", flush=True)
+                    decision.current_phase = next_lane
+                    decision.phase_timer = int(green_time)
+                    decision.decision_reason = reason
+                    if "Emergency" in reason: decision.total_emergencies += 1
+                    # --- TRANSITION END ---
+                else:
+                    if decision.current_phase is not None:
+                        traci.trafficlight.setPhase(TL_ID, PHASE_MAP[decision.current_phase] + 1)
+                        send_to_arduino(decision.current_phase, "YELLOW")
+                        for _ in range(YELLOW): 
+                            traci.simulationStep()
+                            time.sleep(1.0)
+                            step += 1
+                        decision.current_phase = None
+                    traci.trafficlight.setRedYellowGreenState(TL_ID, "rrrrrrrrrrrrrrrr")
+                    decision.decision_reason = "Idle (All Clear)"
+
+            
+            # 4. Step Simulation
+            traci.simulationStep()
+            time.sleep(1.0) # Full sync: 1 simulation second = 1 real second
+
+            # 5. Debug Console Output (Every 10 steps / 10 seconds)
+            if step % 10 == 0:
+                os.system('cls' if os.name == 'nt' else 'clear')
+                print("==============================")
+                print(f"[STEP {step}] - UPDATED EVERY 10 SECONDS")
+                print("\nHYBRID DENSITY (Vision | SUMO):")
+                for d in LANE_MAP.keys():
+                    print(f"{d}: {v_densities[d]:.1f} | {s_densities[d]:.1f} \u2192 Total: {densities[d]:.1f}")
+
+                print("\nSIGNAL:")
+                print(f"Active Lane : {decision.current_phase or 'ALL RED'}")
+                print(f"Green Time  : {max(0, int(decision.phase_timer))} sec")
+                print("\nEMERGENCY:")
+                is_ev = "YES" if decision.ev_queue or current_emergency else "NO"
+                queued_ev = decision.ev_queue[0] if decision.ev_queue else (current_emergency[0] if current_emergency else "NONE")
+                print(f"Detected    : {is_ev}")
+                print(f"Lane        : {queued_ev}")
+                print(f"Reason      : {decision.decision_reason}")
+                if arduino: print(f"Arduino     : Connected on {ARDUINO_PORT}")
+                else: print("Arduino     : NOT CONNECTED")
+                print("==============================")
 
             if cv2.waitKey(1) == ord('q'): break
 
-            traci.simulationStep()
-            time.sleep(0.01)
-
             if decision.phase_timer > 0:
-                decision.phase_timer -= 0.5
-            else:
-                if decision.current_phase is not None:
-                    phase_map = {"N": 0, "E": 2, "S": 4, "W": 6}
-                    yellow_phase = phase_map[decision.current_phase] + 1
-                    traci.trafficlight.setPhase(TL_ID, yellow_phase)
-                    for _ in range(YELLOW):
-                        traci.simulationStep()
-                        time.sleep(0.05)
-                    decision.current_phase = None
-
+                decision.phase_timer -= 1  # Standard decrement
+            
             step += 1
             
-    except traci.exceptions.FatalTraCIError:
-        print("\n[INFO] SUMO closed by user.", flush=True)
     except Exception as e:
-        print(f"\n[ERROR] Simulation Loop Error: {e}", flush=True)
+        print(f"\n[ERROR] Simulation Error: {e}", flush=True)
     finally:
         cv2.destroyAllWindows()
         try: traci.close()

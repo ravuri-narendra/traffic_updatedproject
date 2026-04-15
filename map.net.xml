@@ -130,18 +130,22 @@
     </edge>
 
    <tlLogic id="center" type="static" programID="0" offset="0">
-    <!-- N Green -->
+    <!-- N Green Cycle -->
     <phase duration="30" state="ggggrrrrrrrrrrrr"/>
-    <phase duration="5"  state="yyyyrrrrrrrrrrrr"/>
-    <!-- E Green -->
+    <phase duration="3"  state="yyyyrrrrrrrrrrrr"/>
+    <phase duration="2"  state="rrrrrrrrrrrrrrrr"/>
+    <!-- E Green Cycle -->
     <phase duration="30" state="rrrrggggrrrrrrrr"/>
-    <phase duration="5"  state="rrrryyyyrrrrrrrr"/>
-    <!-- S Green -->
+    <phase duration="3"  state="rrrryyyyrrrrrrrr"/>
+    <phase duration="2"  state="rrrrrrrrrrrrrrrr"/>
+    <!-- S Green Cycle -->
     <phase duration="30" state="rrrrrrrrggggrrrr"/>
-    <phase duration="5"  state="rrrrrrrryyyyrrrr"/>
-    <!-- W Green -->
+    <phase duration="3"  state="rrrrrrrryyyyrrrr"/>
+    <phase duration="2"  state="rrrrrrrrrrrrrrrr"/>
+    <!-- W Green Cycle -->
     <phase duration="30" state="rrrrrrrrrrrrgggg"/>
-    <phase duration="5"  state="rrrrrrrrrrrryyyy"/>
+    <phase duration="3"  state="rrrrrrrrrrrryyyy"/>
+    <phase duration="2"  state="rrrrrrrrrrrrrrrr"/>
 </tlLogic>
     <junction id="E" type="priority" x="200.00" y="100.00" incLanes="C2E_0" intLanes=":E_0_0" shape="200.00,100.00 200.00,96.80 200.00,100.00">
         <request index="0" response="0" foes="0" cont="0"/>

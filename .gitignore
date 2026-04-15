@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.env
+.venv
+env/
+venv/
+build/
+dist/
+
+# AI Models
+yolov8n.pt
+
+# Project Specific
+.gemini/
+debug_frame.png
+debug_frame_4way.png
+*.log
+
+# Windows
+Thumbs.db
+desktop.ini
