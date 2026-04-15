@@ -1,70 +1,63 @@
-# Intelligent SUMO-YOLO Traffic Control System
+# Intelligent Digital Twin: AI-Vision Traffic Control System
 
-A high-performance, vision-integrated traffic management system that uses YOLOv8 to monitor SUMO simulations and intelligently control traffic signals in real-time.
+A high-performance, **Digital Twin** traffic management system that bridges the gap between simulated urban environments and physical hardware. This project uses **YOLOv8** to monitor **SUMO (Simulation of Urban MObility)** environments and intelligently controls traffic signals using real-time Computer Vision and Signal Preemption logic.
 
 ![Vision Analytics](debug_frame_4way.png)
 
-## 🚀 Key Features
+## 🌟 Key Innovations
 
-- **Vision-Based Density Detection**: Uses **YOLOv8** to identify and count vehicles (cars, trucks, buses) directly from the SUMO-GUI window.
-- **Dynamic Signal Timing**: Implements a density-weighted green light allocation algorithm (higher density = more green time).
-- **Emergency Vehicle Priority**: Vision-based detection of emergency vehicles (blue-flashers) providing immediate priority signal preemption.
-- **Starvation Prevention**: Guaranteed service for all lanes using a Round-Robin cycle combined with a maximum wait-time "Starvation Fix."
-- **Real-Time Dashboard**:
-  - **Live Console Feed**: Detailed step-by-step logs of lane densities and signal decisions.
-  - **Web Interface**: A modern React-based frontend providing a visual representation of the junction status.
-  - **Socket.io Streaming**: Low-latency state synchronization between the Python controller and the web dashboard.
+### 1. Hybrid Perception (Vision + Simulation)
+Unlike standard traffic simulations that rely on internal data, this system uses a **Vision Agent** to "see" the traffic just like a real-world CCTV camera.
+- **YOLOv8 Detection**: Real-time identification of cars, trucks, and buses.
+- **Weighted Density**: Larger vehicles (trucks/buses) are weighted 2.5x more than cars to better represent road pressure.
+- **Hybrid Max-Pooling**: The system compares Vision data against raw SUMO data and selects the highest value, ensuring zero failure even if the camera view is partially obstructed.
+
+### 2. Emergency Vehicle (EV) Preemption
+A professional-grade emergency priority system:
+- **Instant Interrupt**: When an ambulance is detected (via blue-color signature), the system **immediately preempts** the current green light, instantly cutting its timer to zero.
+- **Safety Transitions**: Triggers a forced Yellow (3s) and All-Red (2s) phase to clear the intersection before the ambulance proceeds.
+- **Blind-Spot Prevention**: Regions of Interest (ROI) are extended to the center of the intersection to maintain continuous tracking of the EV until it has fully cleared the junction.
+
+### 3. Hardware-in-the-Loop (Digital Twin)
+The simulation is locked to a physical **Arduino/ESP32** traffic controller.
+- **Serial Communication**: Every signal change (Green/Yellow/Red) in the digital world is instantly transmitted over USB Serial to physical LEDs.
+- **Real-Time Sync**: 1 simulation second = 1 real second, creating a perfect mirror between global simulation and physical hardware.
 
 ## 🛠️ Tech Stack
 
-- **Backend**: Python 3.x, OpenCV, MSS (Screen Capture), Win32GUI
-- **Simulation**: Eclipse SUMO (Simulation of Urban MObility)
-- **AI/ML**: Ultralytics YOLOv8 (yolov8n.pt)
-- **Communication**: Flask, Flask-SocketIO
-- **Frontend**: React, Vite, Socket.io-client
+- **Core Logic**: Python 3.10+
+- **Traffic Engine**: Eclipse SUMO
+- **AI/CV**: Ultralytics YOLOv8
+- **Hardware**: Arduino / ESP32 (C++ / `.ino`)
+- **Libraries**: TraCI, MSS (Screen Capture), NumPy, OpenCV, PySerial
 
-## 📋 Prerequisites
+## 📋 Setup & Installation
 
 1.  **SUMO**: [Install Eclipse SUMO](https://www.eclipse.org/sumo/) and set the `SUMO_HOME` environment variable.
-2.  **Python Packages**:
+2.  **Dependencies**:
     ```bash
-    pip install opencv-python numpy mss pywin32 ultralytics flask flask-socketio flask-cors
+    pip install opencv-python numpy mss pywin32 ultralytics pyserial
     ```
-3.  **YOLO Model**: Ensure `yolov8n.pt` is in the root directory.
+3.  **Hardware**: Upload `arduino_traffic_control.ino` to your Arduino/ESP32 and update the `ARDUINO_PORT` in `main.py` (default is `COM7`).
 
 ## 🏃 Running the Project
 
-### 1. Start the Intelligent Controller
-Run the main script. This will launch SUMO-GUI and start the vision agent.
-```bash
-python main.py
-```
-*Note: Ensure the SUMO-GUI window is visible on your screen after it launches so the vision agent can capture it.*
+1.  Launch the controller:
+    ```bash
+    python main.py
+    ```
+2.  The script will:
+    - Open the SUMO-GUI automatically.
+    - Connect to the Arduino on the specified COM port.
+    - Start the live Vision Analysis window.
 
-### 2. Start the Monitoring Dashboard (Optional)
-Navigate to the frontend directory and start the development server.
-```bash
-cd frontend
-npm install
-npm run dev
-```
-Open your browser to the provided URL (usually `http://localhost:5173`) to view the live junction map.
+## 📂 Project Structure
 
-## 🧠 System Architecture
-
-1.  **Vision Agent**: Captures the SUMO-GUI window, applies Region of Interest (ROI) masks to each lane, and runs YOLOv8 detections. It also performs pixel-level analysis for emergency vehicle detection.
-2.  **Decision Agent**: Analyzes the density data. It follows a clockwise Round-Robin sequence but intercepts the cycle if an emergency vehicle is detected or if a lane has been waiting too long.
-3.  **TraCI Bridge**: Communicates decisions back to SUMO, setting traffic light phases and stepping the simulation.
-4.  **Web Server**: Broadcasts the internal state (densities, phases, reasons) to all connected clients.
-
-## 📂 File Structure
-
-- `main.py`: The heart of the system containing Vision, Decision, and Server logic.
-- `traffic.sumocfg`: SUMO configuration file.
-- `map.net.xml`: The 4-way junction network definition.
-- `routes.rou.xml`: Traffic demand and vehicle route definitions.
-- `frontend/`: The React dashboard source code.
-- `yolov8n.pt`: Pre-trained YOLOv8 weights.
+- `main.py`: The main controller (Vision Agent, Decision Logic, Hardware Interface).
+- `arduino_traffic_control.ino`: Firmware for the physical LED traffic lights.
+- `traffic.sumocfg`: Network and route configuration for SUMO.
+- `map.net.xml`: The 4-way junction design.
+- `routes.rou.xml`: Traffic demand definitions.
 
 ---
-*Developed for intelligent urban traffic management experiments.*
+*Developed by Muniswar Talasila for advanced urban mobility and AI-driven automation experiments.*
