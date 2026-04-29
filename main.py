@@ -37,9 +37,11 @@ MIN_GREEN = 5
 MAX_GREEN = 60
 YELLOW = 3
 ALL_RED = 2
-EMERGENCY_HOLD = 20
+EMERGENCY_HOLD = 60        # Max green time (seconds) for EV; released earlier if cleared
+EV_COOLDOWN    = 60       # Seconds before a served EV lane can be re-queued
 DENSITY_FACTOR = 2.0
 DENSITY_THRESHOLD = 0.5
+SIM_SPEED_DELAY = 1.0  # <-- CHANGE THIS TO 0.1 to make the simulation run 10x faster!
 
 # 1. LANE & PHASE MAPPING
 LANE_MAP = {
@@ -117,7 +119,14 @@ class VisionAgent:
         self.rois["W"] = np.array([[int(0.1*w), int(0.45*h)], [int(0.48*w), int(0.45*h)], [int(0.48*w), int(0.55*h)], [int(0.1*w), int(0.55*h)]], dtype=np.int32)
 
     def detect_vehicles(self, frame):
-        results = self.model(frame, conf=self.confidence, verbose=False)[0]
+        start_time = time.time()
+        # BIG PERFORMANCE FIX: Tell YOLO to resize the image to 320x320 internally before processing. 
+        # This takes 4x less CPU power and is much faster for a basic traffic simulation!
+        results = self.model(frame, conf=self.confidence, imgsz=320, verbose=False)[0]
+        inf_time = (time.time() - start_time) * 1000
+        if inf_time > 300:
+            print(f"[WARNING] 🐌 CPU is slow! YOLO took {inf_time:.0f}ms", flush=True)
+
         detections = []
         annotated = frame.copy()
 
@@ -125,10 +134,19 @@ class VisionAgent:
             x1, y1, x2, y2 = map(int, box.xyxy[0])
             cls = int(box.cls[0])
             label = self.model.names[cls]
-            if label not in ['car', 'truck', 'bus', 'motorcycle', 'bicycle']: continue
+            if label not in ['person', 'car', 'truck', 'bus', 'motorcycle', 'bicycle']: continue
             centroid = ((x1+x2)//2, (y1+y2)//2)
             detections.append({'bbox': (x1, y1, x2, y2), 'centroid': centroid, 'class': label})
-            cv2.rectangle(annotated, (x1,y1),(x2,y2),(0,255,0),2)
+            
+            # --- Visual Distinction for Real-World Variety ---
+            box_color = (0, 255, 0) # Green for standard vehicles
+            if label == 'person': box_color = (0, 165, 255) # Orange for pedestrians
+            elif label in ['bicycle', 'motorcycle']: box_color = (255, 255, 0) # Cyan for 2-wheelers
+            elif label in ['truck', 'bus']: box_color = (0, 0, 255) # Red for heavy vehicles
+            
+            cv2.rectangle(annotated, (x1, y1), (x2, y2), box_color, 2)
+            cv2.putText(annotated, label, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, box_color, 2)
+            
         return detections, annotated
 
     def map_to_lanes(self, detections, frame):
@@ -138,7 +156,14 @@ class VisionAgent:
             cx, cy = det['centroid']
             for lane, pts in self.rois.items():
                 if cv2.pointPolygonTest(pts, (cx,cy), False) >= 0:
-                    densities[lane] += 2.5 if det['class'] in ['truck','bus'] else 1
+                    if det['class'] in ['truck', 'bus']:
+                        densities[lane] += 2.5
+                    elif det['class'] in ['motorcycle', 'bicycle']:
+                        densities[lane] += 0.5
+                    elif det['class'] == 'person':
+                        densities[lane] += 0.3  # People have a minor density footprint but still add to wait time
+                    else:
+                        densities[lane] += 1.0  # Standard Cars
                     break
 
         for lane, pts in self.rois.items():
@@ -164,39 +189,114 @@ class VisionAgent:
 # -------------------- DECISION AGENT --------------------
 class DecisionAgent:
     def __init__(self):
-        self.phase_timer = 0
-        self.current_phase = None
-        self.lanes = ["N", "E", "S", "W"]  
-        self.current_index = 0
+        self.phase_timer    = 0
+        self.current_phase  = None
+        self.lanes          = ["N", "E", "S", "W"]
+        self.current_index  = 0
         self.total_emergencies = 0
-        self.decision_reason = "System Booting"
-        self.ev_queue = []
-        self.resume_index = None
+        self.decision_reason   = "System Booting"
+
+        # --- Multi-EV state ---
+        # ev_queue  : ordered list of lanes waiting for EV green (FIFO by first-detection time)
+        # ev_first_seen : {lane: timestamp} — when each EV was first detected this cycle
+        # ev_cooldown   : {lane: timestamp} — when each lane was last served as EV
+        #                  A lane cannot re-enter ev_queue until EV_COOLDOWN seconds pass.
+        self.ev_queue      = []
+        self.ev_first_seen = {}   # lane → time.time() when first detected
+        self.ev_cooldown   = {}   # lane → time.time() when last served
+        self.resume_index  = None # index to restore normal sequence after all EVs are done
+        self.ev_pending    = False # True while EVs are queued but current phase still running
+        self.is_serving_ev = False # True while actively holding green for an EV
 
     def compute_time(self, density):
         if density <= DENSITY_THRESHOLD:
             return 0
         return min(MAX_GREEN, MIN_GREEN + (density * DENSITY_FACTOR))
 
-    def decide(self, densities, current_lane):
-        # 1. Emergency Priority Logic
-        if self.ev_queue:
-            chosen_lane = self.ev_queue.pop(0)
-            if self.resume_index is None:
-                self.resume_index = self.current_index
-            return chosen_lane, EMERGENCY_HOLD, "🚨 Emergency Queue Priority"
+    def notify_ev_detected(self, ev_lanes):
+        """Called every vision cycle with currently detected EV lanes.
 
-        # 2. Resume sequence after EV
+        Rules:
+          1. A lane already in ev_queue is NOT re-added (dedup).
+          2. A lane that was recently served (within EV_COOLDOWN seconds)
+             is NOT re-added — prevents endless re-queueing of a slow ambulance.
+          3. When the first NEW lane is queued, resume_index is recorded so
+             the normal round-robin can continue correctly after all EVs are served.
+          4. ev_queue stays sorted by first-detection time so the ambulance
+             that has been waiting longest is ALWAYS served first.
+        """
+        now = time.time()
+        new_lanes_added = []
+
+        for lane in ev_lanes:
+            # Skip if already queued
+            if lane in self.ev_queue:
+                continue
+            # Skip if recently served (cooldown active)
+            if lane in self.ev_cooldown and (now - self.ev_cooldown[lane]) < EV_COOLDOWN:
+                remaining_cd = EV_COOLDOWN - (now - self.ev_cooldown[lane])
+                print(f"[EV] Lane {lane} cooldown active — {remaining_cd:.0f}s before re-queue.",
+                      flush=True)
+                continue
+            # Record first-seen time (only if not already tracked)
+            if lane not in self.ev_first_seen:
+                self.ev_first_seen[lane] = now
+
+            self.ev_queue.append(lane)
+            new_lanes_added.append(lane)
+
+        if not new_lanes_added:
+            return
+
+        # Sort ev_queue by first-detection time → earliest detected goes first
+        self.ev_queue.sort(key=lambda l: self.ev_first_seen.get(l, now))
+
+        # Save the resume point once (when the very first EV is queued this cycle)
+        if self.resume_index is None and self.current_phase is not None:
+            current_pos = self.lanes.index(self.current_phase)
+            self.resume_index = (current_pos + 1) % 4
+
+        self.ev_pending = True
+
+        for lane in new_lanes_added:
+            position = self.ev_queue.index(lane) + 1  # 1-indexed position in queue
+            print(
+                f"[EV] 🚨 New EV in lane {lane} (queue position #{position}/{len(self.ev_queue)}). "
+                f"Current lane ({self.current_phase}) finishes first. "
+                f"Full EV queue: {self.ev_queue}. "
+                f"Normal sequence resumes from: {self.lanes[self.resume_index] if self.resume_index is not None else '?'}",
+                flush=True
+            )
+
+    def decide(self, densities, current_lane):
+        """
+        Priority order (each only triggers when phase_timer == 0):
+          1. EV queue  → serve EVs in first-detected order, 20s each
+          2. Resume    → jump back to saved normal-sequence index after all EVs done
+          3. Stay-Green → keep current lane if no one else is waiting
+          4. Round-Robin → advance to next lane with traffic
+        """
+        # 1. Emergency Priority — fires only when the current green has expired
+        if self.ev_queue:
+            self.is_serving_ev = True
+            chosen_lane = self.ev_queue.pop(0)          # First-detected EV goes first
+            self.ev_cooldown[chosen_lane] = time.time() # Start cooldown for this lane
+            if chosen_lane in self.ev_first_seen:       # Clean up tracking dict
+                del self.ev_first_seen[chosen_lane]
+            # ev_pending stays True until the queue is fully empty
+            if not self.ev_queue:
+                self.ev_pending = False
+            return chosen_lane, EMERGENCY_HOLD, f"🚨 EV Priority (Dynamic) — {len(self.ev_queue)} more in queue"
+
+        self.is_serving_ev = False
+
+        # 2. Resume normal sequence after all EVs have been served
         if self.resume_index is not None:
             self.current_index = self.resume_index
-            self.resume_index = None
+            self.resume_index  = None
 
-        # 3. Intelligent Round-Robin / Stay Green logic
-        # First, check if current lane still has significant traffic
+        # 3. Stay-Green logic (no competition)
         if current_lane and densities.get(current_lane, 0) > DENSITY_THRESHOLD:
-            # Check if anyone else is waiting more urgently? 
-            # Simplified: Keep green if density is high, unless others are waiting too long.
-            # But standard Round-Robin usually cycles. Let's allow staying green if no one else is waiting.
             others_waiting = any(v > DENSITY_THRESHOLD for k, v in densities.items() if k != current_lane)
             if not others_waiting:
                 return current_lane, self.compute_time(densities[current_lane]), "Stay Green (No competition)"
@@ -204,12 +304,12 @@ class DecisionAgent:
         # 4. Standard Round-Robin
         start_search = (self.current_index + 1) % 4
         for i in range(4):
-            idx = (start_search + i) % 4
+            idx  = (start_search + i) % 4
             lane = self.lanes[idx]
             if densities[lane] > DENSITY_THRESHOLD:
                 self.current_index = idx
                 return lane, self.compute_time(densities[lane]), "Normal Round-Robin"
-        
+
         return None, 0, "No traffic detected"
 
 # -------------------- UTILS --------------------
@@ -291,6 +391,7 @@ def run():
     v_densities = {d: 0.0 for d in LANE_MAP.keys()} # Vision only
     s_densities = {d: 0.0 for d in LANE_MAP.keys()} # SUMO only
     current_emergency = []
+    last_print_time = time.time()
 
     try:
         while traci.simulation.getMinExpectedNumber() > 0:
@@ -300,34 +401,35 @@ def run():
                 detections, annotated = vision.detect_vehicles(frame)
                 v_densities, current_emergency = vision.map_to_lanes(detections, frame)
 
-                # Fetch SUMO direct vehicle counts and combine for Hybrid Density
+                # --- HYBRID PROCESSING (Vision + SUMO Fallback) ---
                 for direction, entity_id in LANE_MAP.items():
+                    # 1. Get raw vision density and apply Smoothing (Memory)
+                    raw_v = v_densities[direction]
+                    vision_val = max(raw_v, densities[direction] * 0.7)
+
+                    # 2. Get SUMO Ground Truth
                     try:
-                        # Normalize vehicle count to a comparable density scale
-                        # traci returns vehicle count; vision returns weighted pixels/detections
                         sumo_count = traci.edge.getLastStepVehicleNumber(entity_id) if entity_id in traci.edge.getIDList() else traci.lane.getLastStepVehicleNumber(entity_id)
                         s_densities[direction] = float(sumo_count)
-                        
-                        # Hybrid Mode: Take max of vision and simulation to ensure we don't miss anything
-                        densities[direction] = max(v_densities[direction], s_densities[direction])
                     except:
-                        densities[direction] = v_densities[direction]
+                        s_densities[direction] = 0.0
+                    
+                    # 3. Vision-Priority Hybrid Decision (90% Vision / 10% SUMO)
+                    # This gives 'Priority to Vision' so the AI leads the project,
+                    # while SUMO acts as a 10% safety anchor.
+                    densities[direction] = (vision_val * 0.9) + (s_densities[direction] * 0.1)
                 
-                # Update EV Queue
-                for lane in current_emergency:
-                    if lane not in decision.ev_queue: decision.ev_queue.append(lane)
+                # EV queue is now managed via notify_ev_detected() below (after vision block)
                 
                 annotated = vision.draw_rois(annotated)
                 cv2.imshow("Vision Analysis", annotated)
 
-            # --- 1.5. EMERGENCY SIGNAL PREEMPTION ---
-            # Real-world traffic systems don't make ambulances wait for a timer to finish.
-            # If an EV is queued but another lane currently has the green light, we MUST interrupt it immediately.
-            if decision.phase_timer > 0 and decision.ev_queue:
-                queued_ev = decision.ev_queue[0]
-                if decision.current_phase is not None and decision.current_phase != queued_ev:
-                    # Force the current green light to end immediately to serve the ambulance
-                    decision.phase_timer = 0
+            # --- 1.5. EV QUEUE UPDATE (No Preemption) ---
+            # When an EV is detected the current phase is allowed to finish.
+            # notify_ev_detected() queues the lane and saves where to resume.
+            if current_emergency:
+                decision.notify_ev_detected(current_emergency)
+
 
             # 2. State Machine for Traffic Signal
             if decision.phase_timer <= 0:
@@ -341,7 +443,8 @@ def run():
                         send_to_arduino(decision.current_phase, "YELLOW")
                         for _ in range(YELLOW):
                             traci.simulationStep()
-                            time.sleep(1.0)
+                            time.sleep(SIM_SPEED_DELAY)
+                            cv2.waitKey(1)  # <-- IMPORTANT: Keeps the OpenCV window from freezing
                             step += 1
                         
                         # 2. Switch to All-Red (Phase index + 2)
@@ -349,7 +452,8 @@ def run():
                         send_to_arduino(decision.current_phase, "RED") 
                         for _ in range(ALL_RED):
                             traci.simulationStep()
-                            time.sleep(1.0)
+                            time.sleep(SIM_SPEED_DELAY)
+                            cv2.waitKey(1)  # <-- IMPORTANT: Keeps the OpenCV window from freezing
                             step += 1
                         
                     # 3. Switch to Green (Target Lane)
@@ -367,7 +471,8 @@ def run():
                         send_to_arduino(decision.current_phase, "YELLOW")
                         for _ in range(YELLOW): 
                             traci.simulationStep()
-                            time.sleep(1.0)
+                            time.sleep(SIM_SPEED_DELAY)
+                            cv2.waitKey(1)  # <-- IMPORTANT: Keeps the OpenCV window from freezing
                             step += 1
                         decision.current_phase = None
                     traci.trafficlight.setRedYellowGreenState(TL_ID, "rrrrrrrrrrrrrrrr")
@@ -376,10 +481,11 @@ def run():
             
             # 4. Step Simulation
             traci.simulationStep()
-            time.sleep(1.0) # Full sync: 1 simulation second = 1 real second
+            time.sleep(SIM_SPEED_DELAY) # Full sync: 1 simulation second = SIM_SPEED_DELAY real seconds
 
-            # 5. Debug Console Output (Every 10 steps / 10 seconds)
-            if step % 10 == 0:
+            # 5. Debug Console Output (Strictly every 10 real-world seconds)
+            if time.time() - last_print_time >= 10.0:
+                last_print_time = time.time()
                 os.system('cls' if os.name == 'nt' else 'clear')
                 print("==============================")
                 print(f"[STEP {step}] - UPDATED EVERY 10 SECONDS")
@@ -389,18 +495,39 @@ def run():
 
                 print("\nSIGNAL:")
                 print(f"Active Lane : {decision.current_phase or 'ALL RED'}")
-                print(f"Green Time  : {max(0, int(decision.phase_timer))} sec")
+                print(f"Green Time  : {max(0, int(decision.phase_timer))} sec remaining")
+                print(f"Reason      : {decision.decision_reason}")
                 print("\nEMERGENCY:")
                 is_ev = "YES" if decision.ev_queue or current_emergency else "NO"
-                queued_ev = decision.ev_queue[0] if decision.ev_queue else (current_emergency[0] if current_emergency else "NONE")
                 print(f"Detected    : {is_ev}")
-                print(f"Lane        : {queued_ev}")
-                print(f"Reason      : {decision.decision_reason}")
+                if decision.ev_queue:
+                    for pos, ev_lane in enumerate(decision.ev_queue, 1):
+                        wait_since = decision.ev_first_seen.get(ev_lane)
+                        wait_str   = f"{time.time()-wait_since:.0f}s ago" if wait_since else "unknown"
+                        marker = "▶ NEXT" if pos == 1 else f"  #{pos} "
+                        print(f"  {marker}  Lane {ev_lane}  (detected {wait_str})")
+                    if decision.resume_index is not None:
+                        print(f"Resume After: {decision.lanes[decision.resume_index]} (normal round-robin)")
+                    if decision.ev_pending:
+                        print(f"EV Status   : ⏳ Serving lane {decision.current_phase} — {max(0,int(decision.phase_timer))}s left, then EV queue begins")
+                elif current_emergency:
+                    print(f"EV Lane     : {current_emergency[0]} (detected — queueing next cycle)")
+                else:
+                    print(f"EV Lane     : NONE")
                 if arduino: print(f"Arduino     : Connected on {ARDUINO_PORT}")
                 else: print("Arduino     : NOT CONNECTED")
                 print("==============================")
 
             if cv2.waitKey(1) == ord('q'): break
+
+            # --- DYNAMIC EV CLEARING ---
+            # If we are serving an EV and it is no longer detected in the lane, 
+            # we end the priority phase early to resume normal traffic flow.
+            if decision.is_serving_ev and decision.phase_timer > 2:
+                if decision.current_phase not in current_emergency:
+                    print(f"[EV] Lane {decision.current_phase} cleared. Resuming normal process...", flush=True)
+                    decision.phase_timer = 0
+                    decision.is_serving_ev = False
 
             if decision.phase_timer > 0:
                 decision.phase_timer -= 1  # Standard decrement

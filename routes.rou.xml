@@ -4,7 +4,10 @@
 
     <!-- Vehicle Types -->
     <vType id="car" accel="2.5" decel="4.5" length="5" maxSpeed="20" color="1,1,0"/>
-    <vType id="bike" accel="3.0" decel="4.5" length="2" maxSpeed="25" color="1,0,0"/>
+    
+    <!-- BIG FIX: Added guiShape so they actually look like bikes and humans to YOLO -->
+    <vType id="bike" vClass="motorcycle" guiShape="motorcycle" accel="3.0" decel="4.5" length="2" maxSpeed="25" color="1,1,1"/>
+    
     <vType id="bus" accel="1.5" decel="4.0" length="10" maxSpeed="15" color="0,1,0"/>
 
     <vType id="ambulance" vClass="emergency"
@@ -25,10 +28,10 @@
     <flow id="car_we" type="car" route="r_we" begin="0" end="400" vehsPerHour="300" departLane="best" departSpeed="max"/>
 
     <!-- Bikes -->
-    <flow id="bike_ns" type="bike" route="r_ns" begin="0" end="400" vehsPerHour="400" departLane="best"/>
-    <flow id="bike_sn" type="bike" route="r_sn" begin="0" end="400" vehsPerHour="400" departLane="best"/>
-    <flow id="bike_ew" type="bike" route="r_ew" begin="0" end="400" vehsPerHour="400" departLane="best"/>
-    <flow id="bike_we" type="bike" route="r_we" begin="0" end="400" vehsPerHour="400" departLane="best"/>
+    <flow id="bike_ns" type="bike" route="r_ns" begin="0" end="400" vehsPerHour="150" departLane="best"/>
+    <flow id="bike_sn" type="bike" route="r_sn" begin="0" end="400" vehsPerHour="150" departLane="best"/>
+    <flow id="bike_ew" type="bike" route="r_ew" begin="0" end="400" vehsPerHour="150" departLane="best"/>
+    <flow id="bike_we" type="bike" route="r_we" begin="0" end="400" vehsPerHour="150" departLane="best"/>
 
     <!-- Buses -->
     <flow id="bus_ns" type="bus" route="r_ns" begin="0" end="400" vehsPerHour="80" departLane="best"/>
